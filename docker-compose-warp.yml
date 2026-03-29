@@ -35,11 +35,6 @@ services:
       - TZ=Asia/Shanghai
       - AUTHORIZATION=sk-xxx
       - PROXY_URL=socks5://warp:1080  # 设置 PROXY_URL 为 warp 容器的代理地址
-    depends_on:
-      warp:
-        condition: service_healthy  # 只有 warp 的健康检查通过时，chat2api 才会启动
-    networks:
-      - internal_network  # chat2api 和 warp 在同一个内部网络
     volumes:
       - ./data:/app/data # 挂载一些需要保存的数据
 
