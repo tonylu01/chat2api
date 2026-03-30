@@ -6,7 +6,9 @@ import itertools
 import json
 import logging
 import os
+import re
 import secrets
+import signal
 import time
 import unicodedata
 import urllib.parse
@@ -29,18 +31,39 @@ from websockets.exceptions import ConnectionClosed
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MODEL_TIMEOUTS: dict[str, int] = {
+    # GPT-5 family
     "gpt-5.4-pro": 2400,
     "gpt-5-4-pro": 2400,
-    "gpt-5.3": 300,
-    "gpt-5-3": 300,
+    "gpt-5.3": 600,
+    "gpt-5-3": 600,
     "gpt-5.2": 300,
     "gpt-5-2": 300,
     "gpt-5.1": 300,
     "gpt-5-1": 300,
     "gpt-5": 300,
     "gpt-5-mini": 120,
+    # GPT-4.5 family
+    "gpt-4.5-pro": 600,
+    "gpt-4.5": 300,
+    # GPT-4.1 family
     "gpt-4.1": 180,
+    "gpt-4.1-mini": 120,
+    "gpt-4.1-nano": 60,
+    # GPT-4o family
     "gpt-4o": 180,
+    "gpt-4o-mini": 120,
+    # o1 family
+    "o1": 600,
+    "o1-pro": 1200,
+    "o1-mini": 300,
+    "o1-preview": 600,
+    # o3 family
+    "o3": 600,
+    "o3-pro": 1200,
+    "o3-mini": 300,
+    # o4 family
+    "o4-mini": 300,
+    # auto
     "auto": 300,
 }
 
@@ -48,9 +71,25 @@ _DEFAULT_MODELS = (
     "gpt-5.4-pro",
     "gpt-5",
     "gpt-5-mini",
+    "gpt-4.5-pro",
     "gpt-4o",
+    "o3",
+    "o3-mini",
+    "o4-mini",
     "auto",
 )
+
+# Models known to trigger deep-research / web-browsing mode.
+# These need longer stable-poll windows and browsing-phase detection.
+_DEEP_RESEARCH_MODELS: frozenset[str] = frozenset({
+    "gpt-5.4-pro",
+    "gpt-5-4-pro",
+    "gpt-5.3",
+    "gpt-5-3",
+    "gpt-4.5-pro",
+    "o1-pro",
+    "o3-pro",
+})
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -65,7 +104,7 @@ def _env_csv(name: str, default: str = "") -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True)
 class Settings:
     auth_key: str
     host: str
@@ -255,6 +294,52 @@ logger = logging.getLogger("cdp_proxy")
 
 
 # ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+
+class _Metrics:
+    """Simple in-memory request metrics (thread-safe via asyncio single-thread)."""
+
+    def __init__(self) -> None:
+        self.total_requests: int = 0
+        self.total_errors: int = 0
+        self.total_latency: float = 0.0
+        self.model_requests: dict[str, int] = {}
+        self.model_errors: dict[str, int] = {}
+        self._start_time: float = time.monotonic()
+
+    def record_request(self, model: str, latency: float, error: bool = False) -> None:
+        self.total_requests += 1
+        self.total_latency += latency
+        self.model_requests[model] = self.model_requests.get(model, 0) + 1
+        if error:
+            self.total_errors += 1
+            self.model_errors[model] = self.model_errors.get(model, 0) + 1
+
+    def snapshot(self) -> dict[str, Any]:
+        avg_latency = (self.total_latency / self.total_requests) if self.total_requests else 0.0
+        error_rate = (self.total_errors / self.total_requests) if self.total_requests else 0.0
+        return {
+            "uptime_seconds": round(time.monotonic() - self._start_time, 1),
+            "total_requests": self.total_requests,
+            "total_errors": self.total_errors,
+            "error_rate": round(error_rate, 4),
+            "avg_latency_seconds": round(avg_latency, 3),
+            "by_model": {
+                model: {
+                    "requests": count,
+                    "errors": self.model_errors.get(model, 0),
+                }
+                for model, count in self.model_requests.items()
+            },
+        }
+
+
+METRICS = _Metrics()
+
+
+# ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
 
@@ -265,6 +350,67 @@ def _now() -> float:
 
 def _normalize_text(value: str) -> str:
     return unicodedata.normalize("NFC", value).replace("\r\n", "\n").replace("\r", "\n")
+
+
+# Regex patterns for post-processing assistant text
+# Matches "Thought for N seconds/minutes" prefix lines produced by thinking models
+_RE_THOUGHT_PREFIX = re.compile(
+    r'^Thought for [\d.]+ (?:second|minute)s?\s*\n+',
+    re.IGNORECASE,
+)
+# Matches full lines that are browsing/searching status (produced during deep-research phase)
+_RE_BROWSING_LINE = re.compile(
+    r'^(?:Browsing|Searching|Reading|Analyzing|Gathering|Looking up|Fetching|Visiting)[^\n]{0,200}\n?',
+    re.IGNORECASE | re.MULTILINE,
+)
+# Matches inline citation badge patterns produced by ChatGPT deep-research:
+#   single-line:  "Bank for International Settlements+2"  "arXiv+3"
+#   multi-line:   "Federal Reserve\n+2\nStripe\n+3\n"  (innerText of citation pill <a>)
+_RE_CITATION_INLINE = re.compile(
+    r'(?:[\w][^\n+]{0,80}\+\d+)+'          # single-line: SourceName+N[SourceName+N...]
+    r'|(?:^[^\n+\d]{1,80}\n\+\d+\n?)+',    # multi-line:  SourceName\n+N\n
+    re.MULTILINE,
+)
+# Matches standalone "+N" lines that are leftover superscript numbers
+_RE_PLUS_NUMBER_LINE = re.compile(r'^\+\d+\s*$', re.MULTILINE)
+# Matches 【N†sourceName】 style citations
+_RE_CITATION_BRACKET = re.compile(r'【\d+†[^】]{0,100}】')
+
+
+def _is_only_citations(text: str) -> bool:
+    """Return True when text consists entirely of citation-badge noise (no real content).
+
+    ChatGPT deep-research citation pills render as innerText like:
+        "Federal Reserve\\n+2\\nStripe\\n+3\\n..."
+    After stripping those patterns, if less than 40 printable chars remain
+    the response is pure browsing-phase noise.
+    """
+    cleaned = _RE_CITATION_INLINE.sub('', text)
+    cleaned = _RE_PLUS_NUMBER_LINE.sub('', cleaned)
+    cleaned = _RE_CITATION_BRACKET.sub('', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return len(cleaned) < 40
+
+
+def _clean_assistant_text(text: str) -> str:
+    """Remove deep-research noise: thinking prefix, browsing status lines, citation badges."""
+    if not text:
+        return text
+    # 1. Strip "Thought for N seconds" prefix
+    text = _RE_THOUGHT_PREFIX.sub('', text)
+    # 2. Remove browsing status lines
+    text = _RE_BROWSING_LINE.sub('', text)
+    # 3. Remove inline citation badges (single-line and multi-line variants)
+    text = _RE_CITATION_INLINE.sub('', text)
+    # 4. Remove leftover standalone "+N" lines
+    text = _RE_PLUS_NUMBER_LINE.sub('', text)
+    # 5. Remove bracket citations 【N†source】
+    text = _RE_CITATION_BRACKET.sub('', text)
+    # 6. Collapse excessive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # 7. Strip trailing whitespace on each line
+    text = '\n'.join(line.rstrip() for line in text.split('\n'))
+    return text.strip()
 
 
 def _sanitize_excerpt(value: str, limit: int = 160) -> str:
@@ -293,15 +439,36 @@ def _parse_timeout_seconds(payload: dict[str, Any], model: str) -> int:
     return SETTINGS.model_timeouts.get(model, SETTINGS.default_timeout_seconds)
 
 
+# Maps API-facing model names to the internal ChatGPT cookie slug.
+# Only entries that differ need to be listed; unlisted names are passed through.
+_MODEL_SLUG_MAP: dict[str, str] = {
+    # GPT-5 family (dot→dash normalisation used by some callers)
+    "gpt-5-4-pro": "gpt-5.4-pro",
+    "gpt-5-3": "gpt-5.3",
+    "gpt-5-2": "gpt-5.2",
+    "gpt-5-1": "gpt-5.1",
+    # GPT-4.1 family — ChatGPT UI may use dotted form
+    "gpt-4.1": "gpt-4.1",
+    "gpt-4.1-mini": "gpt-4.1-mini",
+    "gpt-4.1-nano": "gpt-4.1-nano",
+    # o-series aliases
+    "o1-preview": "o1-preview",
+    # Common external aliases
+    "chatgpt-4o-latest": "gpt-4o",
+    "gpt-4-turbo": "gpt-4o",
+}
+
+
 def _model_cookie_payload(model_name: str) -> str:
     effort = "extended"
-    slug = model_name
-    if model_name.endswith("-low"):
+    base = model_name
+    if base.endswith("-low"):
         effort = "low"
-        slug = model_name.removesuffix("-low")
-    elif model_name.endswith("-default"):
+        base = base.removesuffix("-low")
+    elif base.endswith("-default"):
         effort = "default"
-        slug = model_name.removesuffix("-default")
+        base = base.removesuffix("-default")
+    slug = _MODEL_SLUG_MAP.get(base, base)
     return urllib.parse.quote(json.dumps({"model": slug, "effort": effort}, separators=(",", ":")))
 
 
@@ -325,8 +492,13 @@ _RATE_LIMIT_PATTERNS = (
     "slow down",
     "rate limit",
     "you’re making requests",
-    "you're making requests",
     "limit reached",
+    "usage cap",
+    "you’ve reached your limit",
+    "you have reached your limit",
+    "daily limit",
+    "message limit",
+    "reached the limit",
 )
 
 
@@ -444,20 +616,116 @@ def build_prompt_from_messages(messages: list[dict[str, Any]] | Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _scan_chrome_devtools_port_sync(host: str, timeout: float = 1.5) -> int | None:
+    """Auto-discover a running Chrome DevTools endpoint via OS listening ports.
+
+    Uses ``lsof`` (macOS/Linux) to enumerate TCP-LISTEN ports, then probes
+    only those for a valid ``/json/version`` response.  Falls back to a small
+    set of well-known ports if ``lsof`` is unavailable.  Completes in < 5 s.
+    """
+    import subprocess
+
+    listening_ports: list[int] = []
+
+    # --- Strategy 1: OS-level enumeration (fast, no network I/O) ----------
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fn"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in proc.stdout.splitlines():
+            # lsof -Fn emits lines like "n*:9222" or "n127.0.0.1:20050"
+            if line.startswith("n") and ":" in line:
+                port_str = line.rsplit(":", 1)[-1]
+                try:
+                    listening_ports.append(int(port_str))
+                except ValueError:
+                    pass
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # lsof not available — try ss (Linux)
+        try:
+            proc = subprocess.run(
+                ["ss", "-tlnH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in proc.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    addr = parts[3]  # e.g. "127.0.0.1:9222" or "*:9222"
+                    port_str = addr.rsplit(":", 1)[-1]
+                    try:
+                        listening_ports.append(int(port_str))
+                    except ValueError:
+                        pass
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # De-duplicate and sort; prioritise common CDP / AdsPower ranges
+    priority_ports = list(range(9222, 9232)) + list(range(20000, 20010)) + list(range(50000, 50010))
+    if listening_ports:
+        # Put priority ports first, then the rest of OS-discovered ports
+        priority_set = set(priority_ports)
+        ordered: list[int] = []
+        seen: set[int] = set()
+        for p in priority_ports:
+            if p in listening_ports and p not in seen:
+                ordered.append(p)
+                seen.add(p)
+        for p in sorted(set(listening_ports)):
+            if p not in seen:
+                ordered.append(p)
+                seen.add(p)
+        candidate_ports = ordered
+    else:
+        # Fallback: only probe well-known ports (no full scan)
+        candidate_ports = priority_ports
+
+    for port in candidate_ports:
+        try:
+            url = f"http://{host}:{port}/json/version"
+            payload = _http_get_json_sync(url, timeout)
+            ws_url = str(payload.get("webSocketDebuggerUrl") or "")
+            if ws_url:
+                logger.info("Auto-discovered Chrome DevTools on port %s", port)
+                return port
+        except Exception:
+            pass
+    return None
+
+
 def _read_cdp_port_sync(settings: Settings) -> int:
     if settings.browser_port_override is not None:
         return settings.browser_port_override
+    # 1. Try the DevToolsActivePort file (standard AdsPower location)
     try:
         with open(settings.devtools_port_file, "r", encoding="utf-8") as handle:
-            return int(handle.readline().strip())
-    except FileNotFoundError as exc:
-        raise BrowserUnavailableError(
-            f"DevToolsActivePort file not found: {settings.devtools_port_file}"
-        ) from exc
+            port = int(handle.readline().strip())
+            # Verify the port is actually reachable before returning it
+            try:
+                _http_get_json_sync(
+                    f"http://{settings.browser_http_host}:{port}/json/version",
+                    timeout=2.0,
+                )
+                return port
+            except Exception:
+                logger.warning(
+                    "DevToolsActivePort file says %s but port is unreachable — scanning...", port
+                )
+    except FileNotFoundError:
+        logger.warning("DevToolsActivePort file not found (%s) — auto-scanning ports...", settings.devtools_port_file)
     except ValueError as exc:
         raise BrowserUnavailableError(
             f"DevToolsActivePort file is malformed: {settings.devtools_port_file}"
         ) from exc
+    # 2. Fallback: auto-scan to find a Chrome DevTools endpoint
+    discovered = _scan_chrome_devtools_port_sync(settings.browser_http_host)
+    if discovered is not None:
+        return discovered
+    raise BrowserUnavailableError(
+        f"Cannot find Chrome DevTools. "
+        f"Make sure AdsPower browser is open. "
+        f"(DevToolsActivePort file: {settings.devtools_port_file})"
+    )
 
 
 def _http_get_json_sync(url: str, timeout: float) -> Any:
@@ -672,6 +940,20 @@ _BOOTSTRAP_TEMPLATE = r"""
         '[aria-label*="More"]',
         '[aria-label*="Read aloud"]',
         '[aria-label*="Edit"]',
+        // Citation pills produced by deep-research / web-browsing mode
+        '[data-testid="webpage-citation-pill"]',
+        '[data-testid*="citation"]',
+        '[data-testid*="source-pill"]',
+        // Superscript citation numbers and footnote markers
+        'sup',
+        '[class*="footnote"]',
+        '[class*="citation"]',
+        // Browsing / searching status indicators
+        '[role="status"]',
+        '[aria-live="polite"]',
+        '[data-testid*="browsing"]',
+        '[data-testid*="thinking-indicator"]',
+        '[data-testid*="progress"]',
       ].join(',');
       const findComposer = () => queryFirst(composerSelectors);
       const textOf = (el) => {
@@ -701,22 +983,56 @@ _BOOTSTRAP_TEMPLATE = r"""
       const extractTurnText = (node) => {
         if (!node) return '';
         const clone = stripNode(node);
-        const candidates = [];
-        const pushCandidate = (el) => {
+        // Targeted content selectors — prefer these over the full node text
+        const targetedSelectors = '.markdown, [class*="markdown"], [data-testid="message-content"], article, pre, code, table, figure, figcaption, [data-testid*="artifact"]';
+        const targetedCandidates = [];
+        const allCandidates = [];
+        const pushAll = (el) => {
           const text = stripLeadingLabels(textOf(el));
-          if (text) candidates.push(text);
+          if (text) allCandidates.push(text);
         };
-        pushCandidate(clone);
-        clone.querySelectorAll('.markdown, [class*="markdown"], [data-testid="message-content"], article, pre, code, table, figure, figcaption, [data-testid*="artifact"]').forEach(pushCandidate);
+        const pushTargeted = (el) => {
+          const text = stripLeadingLabels(textOf(el));
+          if (text) { targetedCandidates.push(text); allCandidates.push(text); }
+        };
+        pushAll(clone);
+        clone.querySelectorAll(targetedSelectors).forEach(pushTargeted);
         const fallbackArtifactLabels = [];
         clone.querySelectorAll('canvas, svg, img').forEach((el) => {
           const label = el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('title') || '';
           if (label.trim()) fallbackArtifactLabels.push(label.trim());
         });
-        if (!candidates.length && fallbackArtifactLabels.length) candidates.push(fallbackArtifactLabels.join('\n'));
-        if (!candidates.length) return '';
-        candidates.sort((a, b) => b.length - a.length);
-        return candidates[0];
+        if (!allCandidates.length && fallbackArtifactLabels.length) allCandidates.push(fallbackArtifactLabels.join('\n'));
+        if (!allCandidates.length) return '';
+        // Prefer the longest targeted candidate (e.g. .markdown content) when it
+        // is substantial — avoids picking the full-clone text that may include
+        // citation-pill noise when deep-research is active.
+        if (targetedCandidates.length) {
+          targetedCandidates.sort((a, b) => b.length - a.length);
+          const best = targetedCandidates[0];
+          if (best.length >= 50) return best;
+        }
+        allCandidates.sort((a, b) => b.length - a.length);
+        return allCandidates[0];
+      };
+      // Check whether the last assistant turn's .markdown contains real prose
+      // (paragraphs, headings, lists, tables) vs. just citation links.
+      const hasSubstantialContent = (node) => {
+        if (!node) return false;
+        const md = node.querySelector('.markdown, [class*="markdown"]');
+        if (!md) return false;
+        const clone = md.cloneNode(true);
+        // Remove citation pills and superscripts before checking
+        clone.querySelectorAll(pruneSelectors).forEach((el) => el.remove());
+        // Check for structural HTML elements that indicate real written content
+        const substantialTags = 'p, h1, h2, h3, h4, h5, h6, li, td, th, dd, dt, blockquote, pre, div';
+        const elements = clone.querySelectorAll(substantialTags);
+        let realTextLen = 0;
+        for (const el of elements) {
+          const t = (el.innerText || el.textContent || '').trim();
+          if (t.length > 5) realTextLen += t.length;
+        }
+        return realTextLen >= 40;
       };
       const turnRoots = () => {
         const raw = Array.from(document.querySelectorAll(turnSelector));
@@ -738,16 +1054,25 @@ _BOOTSTRAP_TEMPLATE = r"""
         for (const dialog of dialogs) {
           const text = tidy(dialog.innerText || '');
           if (!text) continue;
-          if (/too many requests|please wait|slow down|rate limit|limit/i.test(text)) {
-            return { dismissed: false, blocked: true, text };
-          }
+          const isRateLimit = /too many requests|please wait|slow down|rate limit|limit reached|usage cap|daily limit/i.test(text);
+          // Always try to click dismiss buttons — even rate-limit dialogs must be
+          // acknowledged so the UI becomes interactive again.
           const buttons = Array.from(dialog.querySelectorAll('button'));
+          let clickedLabel = '';
           for (const button of buttons) {
             const label = tidy(button.innerText || button.getAttribute('aria-label') || '').toLowerCase();
-            if (['got it', 'dismiss', 'close', 'not now', 'ok', 'okay', 'continue'].includes(label)) {
+            if (['got it', 'dismiss', 'close', 'not now', 'ok', 'okay', 'continue', 'i understand'].includes(label)
+                || /got.?it|okay|dismiss/i.test(label)) {
               button.click();
-              return { dismissed: true, blocked: false, text, button: label };
+              clickedLabel = label;
+              break;
             }
+          }
+          if (isRateLimit) {
+            return { dismissed: !!clickedLabel, blocked: true, text, button: clickedLabel };
+          }
+          if (clickedLabel) {
+            return { dismissed: true, blocked: false, text, button: clickedLabel };
           }
         }
         return { dismissed: false, blocked: false, text: '' };
@@ -876,6 +1201,7 @@ _BOOTSTRAP_TEMPLATE = r"""
         const turns = roots.map((node) => ({ role: roleOf(node), text: extractTurnText(node) }));
         const userTurns = turns.filter((t) => t.role === 'user');
         const assistantTurns = turns.filter((t) => t.role === 'assistant');
+        const lastAssistantRoot = assistantTurns.length ? roots.filter((n) => roleOf(n) === 'assistant').pop() : null;
         const dialog = document.querySelector('[role="dialog"]');
         const dialogText = dialog ? tidy(dialog.innerText || '') : '';
         const composer = findComposer();
@@ -891,6 +1217,7 @@ _BOOTSTRAP_TEMPLATE = r"""
           assistantTurnCount: assistantTurns.length,
           lastUserText: userTurns.length ? userTurns[userTurns.length - 1].text : '',
           lastAssistantText: assistantTurns.length ? assistantTurns[assistantTurns.length - 1].text : '',
+          hasSubstantialContent: hasSubstantialContent(lastAssistantRoot),
           streaming: !!document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"]'),
           artifactCount: roots.length ? (roots[roots.length - 1]?.querySelectorAll('canvas, svg, [data-testid*="artifact"]').length || 0) : 0,
           dialogText,
@@ -922,7 +1249,7 @@ def _bootstrap_js(body: str) -> str:
     return _BOOTSTRAP_TEMPLATE.replace("__BODY__", body)
 
 
-@dataclass(slots=True)
+@dataclass()
 class PageSession:
     browser: CdpBrowserClient
     target_id: str
@@ -1143,14 +1470,14 @@ class PageSession:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
+@dataclass()
 class StreamEvent:
     kind: Literal["delta", "done", "error"]
     data: str = ""
     finish_reason: str | None = None
 
 
-@dataclass(slots=True)
+@dataclass()
 class ChatJob:
     id: str
     model: str
@@ -1354,6 +1681,7 @@ class BrowserWorker:
         return page
 
     async def _set_model_cookie(self, page: PageSession, model: str) -> None:
+        logger.debug("Setting model cookie: model=%s deep_research=%s", model, model in _DEEP_RESEARCH_MODELS)
         payload = _model_cookie_payload(model)
         response = await page.call(
             "Network.setCookie",
@@ -1493,6 +1821,7 @@ class BrowserWorker:
         self,
         page: PageSession,
         *,
+        model: str = "",
         timeout_seconds: int,
         cancel_event: asyncio.Event,
         stream_queue: asyncio.Queue[StreamEvent] | None,
@@ -1503,10 +1832,24 @@ class BrowserWorker:
         emitted_text = ""
         stable_polls = 0
         empty_done_polls = 0
+
+        is_deep_research = model in _DEEP_RESEARCH_MODELS or timeout_seconds >= 1200
+        # Deep-research models need more stable polls; standard models just 2
+        if is_deep_research:
+            required_stable_polls = 5
+        elif timeout_seconds >= 600:
+            required_stable_polls = 3
+        else:
+            required_stable_polls = 2
+        # Deep-research: wait at least this many seconds before counting stable polls
+        min_wait_seconds = 30 if is_deep_research else 0
+        max_empty_polls = 40 if is_deep_research else (20 if timeout_seconds >= 600 else 5)
+
         while _now() < deadline:
             if cancel_event.is_set():
                 raise JobCancelledError("Request cancelled while awaiting assistant response")
-            await asyncio.sleep(_poll_interval(timeout_seconds, _now() - start))
+            elapsed = _now() - start
+            await asyncio.sleep(_poll_interval(timeout_seconds, elapsed))
             snapshot = await page.snapshot()
             dialog_text = str(snapshot.get("dialogText") or "")
             body_sample = str(snapshot.get("bodySample") or "")
@@ -1515,6 +1858,26 @@ class BrowserWorker:
             if "something went wrong" in body_sample.lower():
                 raise PageStateError("ChatGPT returned 'Something went wrong'")
             text = _normalize_text(str(snapshot.get("lastAssistantText") or ""))
+
+            # Deep-research browsing-phase guard:
+            # Two complementary heuristics — Python regex on text AND JS DOM
+            # structural check via hasSubstantialContent.  Both must agree the
+            # content is real before we count it as stable progress.
+            is_citation_noise = bool(text) and _is_only_citations(text)
+            has_substantial = bool(snapshot.get("hasSubstantialContent"))
+            still_browsing = is_citation_noise or (is_deep_research and bool(text) and not has_substantial)
+            if still_browsing:
+                logger.debug(
+                    "Browsing phase detected (citation_noise=%s, substantial=%s, %d chars) — resetting stable_polls",
+                    is_citation_noise, has_substantial, len(text),
+                )
+                # Don't update last_text; reset stability counter; continue waiting
+                stable_polls = 0
+                streaming = bool(snapshot.get("streaming"))
+                if not streaming and elapsed < max(min_wait_seconds, 10):
+                    pass  # keep waiting even if stop-button gone
+                continue
+
             if text != last_text:
                 last_text = text
                 stable_polls = 0
@@ -1530,20 +1893,27 @@ class BrowserWorker:
             if streaming:
                 continue
 
+            # Don't start counting stability until minimum wait elapsed (deep-research)
+            if elapsed < min_wait_seconds:
+                continue
+
             if text:
-                required_stable_polls = 3 if timeout_seconds >= 600 else 2
                 if stable_polls >= required_stable_polls:
-                    return text
+                    return _clean_assistant_text(text)
             else:
                 empty_done_polls += 1
                 if snapshot.get("artifactCount") and empty_done_polls >= 2:
                     return "[The assistant returned a non-text artifact/canvas response with no extractable DOM text. Open the ChatGPT page to inspect it.]"
-                if empty_done_polls >= (20 if timeout_seconds >= 600 else 5):
+                if empty_done_polls >= max_empty_polls:
                     break
 
         if last_text:
-            return last_text
-        raise JobTimeoutError("Timed out waiting for assistant response")
+            return _clean_assistant_text(last_text)
+        raise JobTimeoutError(
+            f"Timed out waiting for assistant response "
+            f"(model={model!r}, timeout={timeout_seconds}s, "
+            f"last_text_chars={len(last_text)}, stable_polls={stable_polls})"
+        )
 
     async def _cancel_page_generation(self, page: PageSession) -> None:
         with contextlib.suppress(Exception):
@@ -1596,11 +1966,16 @@ class BrowserWorker:
                 )
                 result = await self._collect_assistant_response(
                     page,
+                    model=job.model,
                     timeout_seconds=job.timeout_seconds,
                     cancel_event=job.cancel_event,
                     stream_queue=job.progress_queue,
                 )
                 self._consecutive_rate_limits = 0
+                logger.info(
+                    "Job %s completed model=%s response_chars=%d elapsed=%.1fs",
+                    job.id, job.model, len(result), _now() - job.created_at,
+                )
                 # Keep page alive for reuse (don't close)
                 self._persistent_page = page
                 return result
@@ -1684,10 +2059,18 @@ class BrowserWorker:
             )
             if not isinstance(result, dict) or not result.get("ok"):
                 raise PageStateError(f"Model fetch failed: {result}")
-            models = [str(model).strip() for model in result.get("models", []) if str(model).strip()]
-            if not models:
+            live_models = [str(model).strip() for model in result.get("models", []) if str(model).strip()]
+            if not live_models:
                 raise PageStateError("ChatGPT returned an empty model list")
-            return models
+            # Merge with default models to ensure full coverage — live models
+            # take priority (appear first), then any defaults not already present.
+            seen: set[str] = set(live_models)
+            merged = list(live_models)
+            for m in self.settings.default_models:
+                if m not in seen:
+                    merged.append(m)
+                    seen.add(m)
+            return merged
         finally:
             await page.close()
 
@@ -1745,9 +2128,21 @@ async def lifespan(app: FastAPI):
         SETTINGS.allowed_origins or (),
         _masked_secret(SETTINGS.auth_key),
     )
+    # Graceful shutdown on SIGTERM (Docker/K8s sends this before SIGKILL)
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def _signal_handler(sig: int) -> None:
+        logger.info("Received signal %s — initiating graceful shutdown", signal.Signals(sig).name)
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _signal_handler, sig)
+
     try:
         yield
     finally:
+        logger.info("Shutting down worker…")
         await worker.stop()
         logger.info("CDP proxy stopped")
 
@@ -1760,8 +2155,25 @@ if SETTINGS.allowed_origins:
         allow_origins=list(SETTINGS.allowed_origins),
         allow_credentials=False,
         allow_methods=["POST", "GET", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-Id"],
     )
+
+
+from starlette.middleware.base import BaseHTTPMiddleware
+
+
+class _RequestIdMiddleware(BaseHTTPMiddleware):
+    """Attach an X-Request-Id header to every response (echo or generate)."""
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("x-request-id") or f"req_{uuid.uuid4().hex[:16]}"
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = request_id
+        return response
+
+
+app.add_middleware(_RequestIdMiddleware)
 
 
 def _get_worker(request: Request) -> BrowserWorker:
@@ -1794,6 +2206,15 @@ async def health(request: Request):
     worker = _get_worker(request)
     return {
         "status": "ok",
+        **worker.health_snapshot(),
+    }
+
+
+@app.get("/metrics")
+async def metrics(request: Request):
+    worker = _get_worker(request)
+    return {
+        **METRICS.snapshot(),
         **worker.health_snapshot(),
     }
 
@@ -1885,11 +2306,19 @@ async def chat_completions(request: Request, _: None = Depends(require_auth)):
 
     disconnect_task = asyncio.create_task(_watch_disconnect(request, job.cancel_event))
 
+    request_id = getattr(request.state, "request_id", "")
+
     if not stream:
+        request_start = time.monotonic()
+        is_error = False
         try:
             result = await job.future
             return JSONResponse(content=_make_completion(model, result))
+        except Exception:
+            is_error = True
+            raise
         finally:
+            METRICS.record_request(model, time.monotonic() - request_start, error=is_error)
             disconnect_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await disconnect_task
@@ -1898,6 +2327,8 @@ async def chat_completions(request: Request, _: None = Depends(require_auth)):
     created = int(time.time())
 
     async def event_stream():
+        stream_start = time.monotonic()
+        is_error = False
         try:
             yield _sse_payload(json.dumps(_make_chunk(
                 completion_id=completion_id,
@@ -1932,6 +2363,7 @@ async def chat_completions(request: Request, _: None = Depends(require_auth)):
                     yield _sse_payload("[DONE]")
                     return
                 if event.kind == "error":
+                    is_error = True
                     error_payload = {
                         "error": {
                             "message": event.data,
@@ -1942,9 +2374,11 @@ async def chat_completions(request: Request, _: None = Depends(require_auth)):
                     yield _sse_payload("[DONE]")
                     return
         except asyncio.CancelledError:
+            is_error = True
             job.cancel_event.set()
             raise
         finally:
+            METRICS.record_request(model, time.monotonic() - stream_start, error=is_error)
             disconnect_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await disconnect_task
