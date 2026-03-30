@@ -34,6 +34,12 @@ _DEFAULT_MODEL_TIMEOUTS: dict[str, int] = {
     # GPT-5 family
     "gpt-5.4-pro": 2400,
     "gpt-5-4-pro": 2400,
+    "gpt-5.4-pro-extended": 3600,
+    "gpt-5-4-pro-extended": 3600,
+    "gpt-5.4-thinking": 1200,
+    "gpt-5-4-thinking": 1200,
+    "gpt-5.4-thinking-extended": 2400,
+    "gpt-5-4-thinking-extended": 2400,
     "gpt-5.3": 600,
     "gpt-5-3": 600,
     "gpt-5.2": 300,
@@ -89,6 +95,18 @@ _DEEP_RESEARCH_MODELS: frozenset[str] = frozenset({
     "gpt-4.5-pro",
     "o1-pro",
     "o3-pro",
+})
+
+# Models that support "effort" in the oai-last-model-config cookie.
+# Pro and Thinking tiers offer Standard / Extended thinking effort.
+_EFFORT_MODELS: frozenset[str] = frozenset({
+    "gpt-5.4-pro",
+    "gpt-5-4-pro",
+    "gpt-4.5-pro",
+    "o1-pro",
+    "o3-pro",
+    "gpt-5.4-thinking",
+    "gpt-5-4-thinking",
 })
 
 
@@ -444,6 +462,7 @@ def _parse_timeout_seconds(payload: dict[str, Any], model: str) -> int:
 _MODEL_SLUG_MAP: dict[str, str] = {
     # GPT-5 family (dot→dash normalisation used by some callers)
     "gpt-5-4-pro": "gpt-5.4-pro",
+    "gpt-5-4-thinking": "gpt-5.4-thinking",
     "gpt-5-3": "gpt-5.3",
     "gpt-5-2": "gpt-5.2",
     "gpt-5-1": "gpt-5.1",
@@ -459,17 +478,52 @@ _MODEL_SLUG_MAP: dict[str, str] = {
 }
 
 
+_EFFORT_SUFFIXES = ("-extended", "-standard", "-low", "-default")
+
+
+def _strip_effort_suffix(model_name: str) -> str:
+    """Return the base model name without any effort suffix."""
+    for suffix in _EFFORT_SUFFIXES:
+        if model_name.endswith(suffix):
+            return model_name.removesuffix(suffix)
+    return model_name
+
+
 def _model_cookie_payload(model_name: str) -> str:
-    effort = "extended"
+    """Build the URL-encoded JSON value for the ``oai-last-model-config`` cookie.
+
+    Effort suffixes (``-extended``, ``-standard``, ``-low``) on the model name
+    override the default.  Only models in ``_EFFORT_MODELS`` include the
+    ``effort`` field — other models omit it entirely, matching ChatGPT's own
+    cookie behaviour.
+    """
+    effort: str | None = None
     base = model_name
-    if base.endswith("-low"):
+
+    # Strip explicit effort suffix
+    if base.endswith("-extended"):
+        effort = "extended"
+        base = base.removesuffix("-extended")
+    elif base.endswith("-standard"):
+        effort = "standard"
+        base = base.removesuffix("-standard")
+    elif base.endswith("-low"):
         effort = "low"
         base = base.removesuffix("-low")
     elif base.endswith("-default"):
-        effort = "default"
+        # Legacy alias — treat as "standard"
+        effort = "standard"
         base = base.removesuffix("-default")
+
     slug = _MODEL_SLUG_MAP.get(base, base)
-    return urllib.parse.quote(json.dumps({"model": slug, "effort": effort}, separators=(",", ":")))
+
+    # Only effort-capable models get the effort field in the cookie.
+    if slug in _EFFORT_MODELS or base in _EFFORT_MODELS:
+        cookie: dict[str, str] = {"model": slug, "effort": effort or "standard"}
+    else:
+        cookie = {"model": slug}
+
+    return urllib.parse.quote(json.dumps(cookie, separators=(",", ":")))
 
 
 def _poll_interval(timeout_seconds: int, elapsed_seconds: float) -> float:
@@ -1681,7 +1735,7 @@ class BrowserWorker:
         return page
 
     async def _set_model_cookie(self, page: PageSession, model: str) -> None:
-        logger.debug("Setting model cookie: model=%s deep_research=%s", model, model in _DEEP_RESEARCH_MODELS)
+        logger.debug("Setting model cookie: model=%s deep_research=%s", model, _strip_effort_suffix(model) in _DEEP_RESEARCH_MODELS)
         payload = _model_cookie_payload(model)
         response = await page.call(
             "Network.setCookie",
@@ -1833,7 +1887,8 @@ class BrowserWorker:
         stable_polls = 0
         empty_done_polls = 0
 
-        is_deep_research = model in _DEEP_RESEARCH_MODELS or timeout_seconds >= 1200
+        base_model = _strip_effort_suffix(model)
+        is_deep_research = base_model in _DEEP_RESEARCH_MODELS or model in _DEEP_RESEARCH_MODELS or timeout_seconds >= 1200
         # Deep-research models need more stable polls; standard models just 2
         if is_deep_research:
             required_stable_polls = 5
