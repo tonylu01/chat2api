@@ -93,6 +93,7 @@ _DEEP_RESEARCH_MODELS: frozenset[str] = frozenset({
     "gpt-5.3",
     "gpt-5-3",
     "gpt-4.5-pro",
+    "gpt-4-5-pro",
     "o1-pro",
     "o3-pro",
 })
@@ -103,6 +104,7 @@ _EFFORT_MODELS: frozenset[str] = frozenset({
     "gpt-5.4-pro",
     "gpt-5-4-pro",
     "gpt-4.5-pro",
+    "gpt-4-5-pro",
     "o1-pro",
     "o3-pro",
     "gpt-5.4-thinking",
@@ -138,7 +140,9 @@ class Settings:
     browser_ws_ping_timeout: float
     browser_ws_close_timeout: float
     request_cooldown_seconds: float
+    deep_research_cooldown_seconds: float
     max_queue_size: int
+    single_flight_only: bool
     page_ready_timeout_seconds: float
     page_create_timeout_seconds: float
     default_timeout_seconds: int
@@ -203,6 +207,11 @@ class RateLimitedError(ProxyError):
 class PromptTooLargeError(ProxyError):
     status_code = 413
     error_type = "prompt_too_large"
+
+
+class UnsupportedOperationError(ProxyError):
+    status_code = 501
+    error_type = "unsupported_operation"
 
 
 class JobTimeoutError(ProxyError):
@@ -284,15 +293,17 @@ def load_settings() -> Settings:
         browser_ws_ping_interval=float(os.getenv("CDP_BROWSER_WS_PING_INTERVAL", "30")),
         browser_ws_ping_timeout=float(os.getenv("CDP_BROWSER_WS_PING_TIMEOUT", "120")),
         browser_ws_close_timeout=float(os.getenv("CDP_BROWSER_WS_CLOSE_TIMEOUT", "10")),
-        request_cooldown_seconds=float(os.getenv("CDP_COOLDOWN", "15")),
-        max_queue_size=int(os.getenv("CDP_MAX_QUEUE", "16")),
+        request_cooldown_seconds=float(os.getenv("CDP_COOLDOWN", "90")),
+        deep_research_cooldown_seconds=float(os.getenv("CDP_DEEP_RESEARCH_COOLDOWN", "300")),
+        max_queue_size=int(os.getenv("CDP_MAX_QUEUE", "1")),
+        single_flight_only=_env_bool("CDP_SINGLE_FLIGHT_ONLY", True),
         page_ready_timeout_seconds=float(os.getenv("CDP_PAGE_READY_TIMEOUT", "60")),
         page_create_timeout_seconds=float(os.getenv("CDP_PAGE_CREATE_TIMEOUT", "20")),
         default_timeout_seconds=default_timeout_seconds,
         models_cache_ttl_seconds=float(os.getenv("CDP_MODELS_CACHE_TTL", "300")),
         default_models=_env_csv("CDP_DEFAULT_MODELS", ",".join(_DEFAULT_MODELS)) or _DEFAULT_MODELS,
         model_timeouts=model_timeouts,
-        rate_limit_cooldown_seconds=float(os.getenv("CDP_RATE_LIMIT_COOLDOWN", "120")),
+        rate_limit_cooldown_seconds=float(os.getenv("CDP_RATE_LIMIT_COOLDOWN", "300")),
         prompt_chunk_size=int(os.getenv("CDP_PROMPT_CHUNK_SIZE", "4000")),
         max_prompt_chars=int(os.getenv("CDP_MAX_PROMPT_CHARS", "200000")),
         log_level=os.getenv("CDP_LOG_LEVEL", "INFO").upper(),
@@ -457,19 +468,30 @@ def _parse_timeout_seconds(payload: dict[str, Any], model: str) -> int:
     return SETTINGS.model_timeouts.get(model, SETTINGS.default_timeout_seconds)
 
 
+def _is_deep_research_job(model: str, timeout_seconds: int | None = None) -> bool:
+    base_model = _strip_effort_suffix(model)
+    return (
+        base_model in _DEEP_RESEARCH_MODELS
+        or model in _DEEP_RESEARCH_MODELS
+        or (timeout_seconds is not None and timeout_seconds >= 1200)
+    )
+
+
 # Maps API-facing model names to the internal ChatGPT cookie slug.
 # Only entries that differ need to be listed; unlisted names are passed through.
 _MODEL_SLUG_MAP: dict[str, str] = {
-    # GPT-5 family (dot→dash normalisation used by some callers)
-    "gpt-5-4-pro": "gpt-5.4-pro",
-    "gpt-5-4-thinking": "gpt-5.4-thinking",
-    "gpt-5-3": "gpt-5.3",
-    "gpt-5-2": "gpt-5.2",
-    "gpt-5-1": "gpt-5.1",
-    # GPT-4.1 family — ChatGPT UI may use dotted form
-    "gpt-4.1": "gpt-4.1",
-    "gpt-4.1-mini": "gpt-4.1-mini",
-    "gpt-4.1-nano": "gpt-4.1-nano",
+    # GPT-5 family: dot→dash (ChatGPT cookie uses dash format)
+    "gpt-5.4-pro": "gpt-5-4-pro",
+    "gpt-5.4-thinking": "gpt-5-4-thinking",
+    "gpt-5.3": "gpt-5-3",
+    "gpt-5.2": "gpt-5-2",
+    "gpt-5.1": "gpt-5-1",
+    # GPT-4.5 family
+    "gpt-4.5-pro": "gpt-4-5-pro",
+    # GPT-4.1 family — accept dashed aliases but keep dotted cookie slugs
+    "gpt-4-1": "gpt-4.1",
+    "gpt-4-1-mini": "gpt-4.1-mini",
+    "gpt-4-1-nano": "gpt-4.1-nano",
     # o-series aliases
     "o1-preview": "o1-preview",
     # Common external aliases
@@ -734,17 +756,34 @@ def _scan_chrome_devtools_port_sync(host: str, timeout: float = 1.5) -> int | No
         # Fallback: only probe well-known ports (no full scan)
         candidate_ports = priority_ports
 
+    # Two-pass scan: first find a browser that has a chatgpt.com tab open,
+    # then fall back to any browser with DevTools.  This avoids connecting to
+    # the user's regular Chrome (e.g. port 9222) instead of AdsPower SunBrowser.
+    fallback_port: int | None = None
     for port in candidate_ports:
         try:
             url = f"http://{host}:{port}/json/version"
             payload = _http_get_json_sync(url, timeout)
             ws_url = str(payload.get("webSocketDebuggerUrl") or "")
-            if ws_url:
-                logger.info("Auto-discovered Chrome DevTools on port %s", port)
+            if not ws_url:
+                continue
+            # Check if this browser has a chatgpt.com tab
+            try:
+                tabs_url = f"http://{host}:{port}/json"
+                tabs = _http_get_json_sync(tabs_url, timeout)
+                has_chatgpt = any("chatgpt.com" in str(t.get("url", "")) for t in tabs if isinstance(t, dict))
+            except Exception:
+                has_chatgpt = False
+            if has_chatgpt:
+                logger.info("Auto-discovered Chrome DevTools on port %s (has chatgpt.com tab)", port)
                 return port
+            if fallback_port is None:
+                fallback_port = port
         except Exception:
             pass
-    return None
+    if fallback_port is not None:
+        logger.info("Auto-discovered Chrome DevTools on port %s (fallback, no chatgpt tab found)", fallback_port)
+    return fallback_port
 
 
 def _read_cdp_port_sync(settings: Settings) -> int:
@@ -1516,6 +1555,13 @@ class PageSession:
 
     async def close(self) -> None:
         with contextlib.suppress(ProxyError, Exception):
+            # Don't close the last tab — that kills the browser process.
+            result = await self.browser.call("Target.getTargets", timeout=10)
+            targets = result.get("result", {}).get("targetInfos", [])
+            page_count = sum(1 for t in targets if t.get("type") == "page")
+            if page_count <= 1:
+                logger.debug("Skipping Target.closeTarget — only %s page tab(s) remain", page_count)
+                return
             await self.browser.call("Target.closeTarget", {"targetId": self.target_id}, timeout=10)
 
 
@@ -1600,6 +1646,8 @@ class BrowserWorker:
         timeout_seconds: int,
         stream: bool,
     ) -> ChatJob:
+        if self.settings.single_flight_only and (self.active_job is not None or not self.queue.empty()):
+            raise QueueFullError("Proxy only allows one in-flight request at a time")
         if self.queue.full():
             raise QueueFullError("Proxy queue is full")
         loop = asyncio.get_running_loop()
@@ -1646,13 +1694,26 @@ class BrowserWorker:
         except asyncio.CancelledError:
             raise
 
-    async def _wait_for_cooldown(self, cancel_event: asyncio.Event) -> None:
-        remaining = self.settings.request_cooldown_seconds - (_now() - self._last_prompt_sent_at)
+    def _inter_request_cooldown_seconds(self, model: str, timeout_seconds: int) -> float:
+        cooldown = self.settings.request_cooldown_seconds
+        if _is_deep_research_job(model, timeout_seconds):
+            cooldown = max(cooldown, self.settings.deep_research_cooldown_seconds)
+        return cooldown
+
+    async def _wait_for_cooldown(
+        self,
+        cancel_event: asyncio.Event,
+        *,
+        model: str,
+        timeout_seconds: int,
+    ) -> None:
+        cooldown_seconds = self._inter_request_cooldown_seconds(model, timeout_seconds)
+        remaining = cooldown_seconds - (_now() - self._last_prompt_sent_at)
         while remaining > 0:
             if cancel_event.is_set():
                 raise JobCancelledError("Request cancelled during cooldown")
             await asyncio.sleep(min(0.5, remaining))
-            remaining = self.settings.request_cooldown_seconds - (_now() - self._last_prompt_sent_at)
+            remaining = cooldown_seconds - (_now() - self._last_prompt_sent_at)
 
     async def _open_chat_page(self, model: str | None = None) -> PageSession:
         await self.browser.connect()
@@ -1798,6 +1859,22 @@ class BrowserWorker:
             raise PageStateError("Could not obtain a fresh empty chat page")
         return snapshot
 
+    @staticmethod
+    def _text_close_enough(expected: str, actual: str) -> bool:
+        """Accept the typed text if it's close enough.  ChatGPT's ProseMirror
+        editor may add/remove whitespace, zero-width chars, or link decorations."""
+        if actual == expected:
+            return True
+
+        def _canonicalize(value: str) -> str:
+            cleaned = _normalize_text(value)
+            cleaned = cleaned.replace("\u200b", "").replace("\ufeff", "")
+            cleaned = re.sub(r"[ \t]+", " ", cleaned)
+            cleaned = re.sub(r" *\n+ *", "\n", cleaned)
+            return cleaned.strip()
+
+        return _canonicalize(actual) == _canonicalize(expected)
+
     async def _type_prompt(self, page: PageSession, prompt: str) -> None:
         expected = _normalize_text(prompt)
         for attempt in range(3):
@@ -1806,7 +1883,7 @@ class BrowserWorker:
             if pm_result.get("ok"):
                 snapshot = await page.snapshot()
                 actual = _normalize_text(str(snapshot.get("composerText") or ""))
-                if actual == expected:
+                if self._text_close_enough(expected, actual):
                     return
                 logger.warning(
                     "ProseMirror typing mismatch on attempt %s: expected=%s actual=%s",
@@ -1817,7 +1894,7 @@ class BrowserWorker:
             fallback = await page.set_composer_text_direct(prompt)
             if fallback.get("ok"):
                 actual_direct = _normalize_text(str(fallback.get("text") or ""))
-                if actual_direct == expected:
+                if self._text_close_enough(expected, actual_direct):
                     return
 
             # Strategy 3: CDP Input.insertText (legacy fallback)
@@ -1828,7 +1905,7 @@ class BrowserWorker:
                     await page.insert_text(prompt, self.settings.prompt_chunk_size)
                     snapshot = await page.snapshot()
                     actual = _normalize_text(str(snapshot.get("composerText") or ""))
-                    if actual == expected:
+                    if self._text_close_enough(expected, actual):
                         return
 
             logger.warning("All typing strategies failed on attempt %s", attempt + 1)
@@ -1887,8 +1964,7 @@ class BrowserWorker:
         stable_polls = 0
         empty_done_polls = 0
 
-        base_model = _strip_effort_suffix(model)
-        is_deep_research = base_model in _DEEP_RESEARCH_MODELS or model in _DEEP_RESEARCH_MODELS or timeout_seconds >= 1200
+        is_deep_research = _is_deep_research_job(model, timeout_seconds)
         # Deep-research models need more stable polls; standard models just 2
         if is_deep_research:
             required_stable_polls = 5
@@ -1918,9 +1994,12 @@ class BrowserWorker:
             # Two complementary heuristics — Python regex on text AND JS DOM
             # structural check via hasSubstantialContent.  Both must agree the
             # content is real before we count it as stable progress.
+            # NOTE: citation-noise detection is only applied to deep-research
+            # models.  Short legitimate responses (e.g. "Yes.") must NOT be
+            # misclassified as citation noise for standard models.
             is_citation_noise = bool(text) and _is_only_citations(text)
             has_substantial = bool(snapshot.get("hasSubstantialContent"))
-            still_browsing = is_citation_noise or (is_deep_research and bool(text) and not has_substantial)
+            still_browsing = is_deep_research and (is_citation_noise or (bool(text) and not has_substantial))
             if still_browsing:
                 logger.debug(
                     "Browsing phase detected (citation_noise=%s, substantial=%s, %d chars) — resetting stable_polls",
@@ -1982,10 +2061,17 @@ class BrowserWorker:
     async def _process_chat_job(self, job: ChatJob) -> str:
         remaining = self._rate_limited_until - _now()
         if remaining > 0:
-            raise RateLimitedError(
-                f"ChatGPT rate limit cooldown active, retry after {remaining:.0f}s",
-                retry_after=int(remaining) + 1,
+            # Wait out the cooldown instead of immediately rejecting.
+            # This lets the caller's request succeed after the pause.
+            logger.info(
+                "Rate limit cooldown active for job %s, waiting %.0fs...",
+                job.id, remaining,
             )
+            while remaining > 0:
+                if job.cancel_event.is_set():
+                    raise JobCancelledError("Request cancelled during rate limit wait")
+                await asyncio.sleep(min(1.0, remaining))
+                remaining = self._rate_limited_until - _now()
 
         send_confirmed = False
         for attempt in range(2):
@@ -1994,7 +2080,11 @@ class BrowserWorker:
             page: PageSession | None = None
             created_new_page = False
             try:
-                await self._wait_for_cooldown(job.cancel_event)
+                await self._wait_for_cooldown(
+                    job.cancel_event,
+                    model=job.model,
+                    timeout_seconds=job.timeout_seconds,
+                )
                 page = await self._acquire_page(job.model)
                 created_new_page = (page is not self._persistent_page)
                 await self._ensure_fresh_chat(page, job.cancel_event)
@@ -2040,7 +2130,8 @@ class BrowserWorker:
                 raise
             except RateLimitedError as exc:
                 self._consecutive_rate_limits += 1
-                multiplier = min(2 ** (self._consecutive_rate_limits - 1), 5)
+                # Gentle backoff: 45s, 60s, 90s cap — ChatGPT usually recovers in <60s
+                multiplier = min(1 + (self._consecutive_rate_limits - 1) * 0.5, 2)
                 cooldown = self.settings.rate_limit_cooldown_seconds * multiplier
                 self._rate_limited_until = _now() + cooldown
                 exc.retry_after = int(cooldown) + 1
@@ -2138,9 +2229,11 @@ class BrowserWorker:
             "browser_connected": self.browser.connected,
             "queue_depth": self.queue.qsize(),
             "max_queue_size": self.settings.max_queue_size,
+            "single_flight_only": self.settings.single_flight_only,
             "active_job": self.active_job.id if self.active_job else None,
             "active_job_age_seconds": active_age,
             "cooldown_seconds": self.settings.request_cooldown_seconds,
+            "deep_research_cooldown_seconds": self.settings.deep_research_cooldown_seconds,
             "rate_limit_cooldown_remaining": round(max(rl_remaining, 0), 1),
             "consecutive_rate_limits": self._consecutive_rate_limits,
         }
@@ -2441,6 +2534,13 @@ async def chat_completions(request: Request, _: None = Depends(require_auth)):
                 job.cancel_event.set()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/v1/embeddings")
+async def embeddings(request: Request, _: None = Depends(require_auth)):
+    raise UnsupportedOperationError(
+        "Embeddings are not supported by cdp_proxy. Use a real embeddings provider instead."
+    )
 
 
 if __name__ == "__main__":
